@@ -10,15 +10,12 @@ shape ``[batch * seq]``, dropping the traffic from O(b*s*V) to O(b*s).
 import torch
 import torch.distributed as dist
 
-from . import parallel_state as ps
+from .parallel import ParallelContext
 
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, target, vocab_start, vocab_end):
-        group = ps.get_tensor_parallel_group()
-        world_size = ps.get_tensor_parallel_world_size()
-
+    def forward(ctx, logits, target, vocab_start, vocab_end, group, world_size):
         # Subtract the global max for numerical stability. One all-reduce over
         # a [n] tensor, not [n, V].
         logits_max = logits.max(dim=-1)[0]
@@ -33,7 +30,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         local_target[target_mask] = 0
 
         flat_logits = logits.view(-1, logits.size(-1))
-        predicted = flat_logits[torch.arange(flat_logits.size(0)), local_target.view(-1)]
+        rows = torch.arange(flat_logits.size(0), device=flat_logits.device)
+        predicted = flat_logits[rows, local_target.view(-1)]
         predicted = predicted.view_as(target).clone()
         predicted[target_mask] = 0.0
         if world_size > 1:
@@ -64,13 +62,24 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         flat[rows, local_target.view(-1)] -= keep
 
         grad_input.mul_(grad_output.unsqueeze(-1))
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None, None
 
 
-def vocab_parallel_cross_entropy(logits, target, vocab_start, vocab_end):
+def vocab_parallel_cross_entropy(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start: int,
+    vocab_end: int,
+    ctx: ParallelContext,
+) -> torch.Tensor:
     """Mean cross-entropy loss from vocab-sharded ``logits``.
 
     ``logits`` is ``[b, s, V/tp]``; ``target`` is ``[b, s]`` of global token ids.
     """
-    loss = _VocabParallelCrossEntropy.apply(logits.float(), target, vocab_start, vocab_end)
+    vocab_size = ctx.tp_size * (vocab_end - vocab_start)
+    if torch.any(target < 0) or torch.any(target >= vocab_size):
+        raise ValueError("target token id is outside the model vocabulary")
+    loss = _VocabParallelCrossEntropy.apply(
+        logits.float(), target, vocab_start, vocab_end, ctx.tp_group, ctx.tp_size
+    )
     return loss.mean()

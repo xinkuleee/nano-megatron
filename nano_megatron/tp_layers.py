@@ -14,16 +14,15 @@ split/merge helpers in ``tests`` obvious to read.
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import parallel_state as ps
 from .mappings import (
     copy_to_tensor_parallel_region,
-    gather_from_tensor_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
     reduce_from_tensor_parallel_region,
 )
+from .parallel import ParallelContext
 
 
 def divide(numerator: int, denominator: int) -> int:
@@ -35,54 +34,57 @@ def divide(numerator: int, denominator: int) -> int:
 class ColumnParallelLinear(nn.Module):
     """y = x @ A, with A sharded column-wise: A = [A_1, ..., A_p].
 
-    The output is left sharded unless ``gather_output`` is set.
+    The output remains hidden-sharded. ``reduce_input_grad=False`` is used when
+    an outer sequence all-gather already owns the input-gradient reduction.
     """
 
-    _tensor_parallel_sharded_parameters = frozenset({"weight", "bias"})
-
-    def __init__(self, in_features, out_features, bias=True, gather_output=False):
+    def __init__(
+        self, in_features: int, out_features: int, ctx: ParallelContext, bias: bool = True
+    ):
         super().__init__()
-        world_size = ps.get_tensor_parallel_world_size()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.out_features_local = divide(out_features, world_size)
-        self.gather_output = gather_output
-
+        self.ctx = ctx
+        self.out_features_local = divide(out_features, ctx.tp_size)
         self.weight = nn.Parameter(torch.empty(in_features, self.out_features_local))
         self.bias = nn.Parameter(torch.zeros(self.out_features_local)) if bias else None
+        self.weight.tensor_parallel_sharded = True
+        if self.bias is not None:
+            self.bias.tensor_parallel_sharded = True
         nn.init.normal_(self.weight, std=0.02)
 
-    def forward(self, x):
+    def forward(self, x, *, reduce_input_grad=True):
         # f: no-op forward, all-reduce the input gradient on the way back.
-        x = copy_to_tensor_parallel_region(x)
+        if reduce_input_grad:
+            x = copy_to_tensor_parallel_region(x, self.ctx)
         y = x @ self.weight
         if self.bias is not None:
             y = y + self.bias
-        return gather_from_tensor_parallel_region(y) if self.gather_output else y
+        return y
 
 
 class RowParallelLinear(nn.Module):
     """y = x @ A, with A sharded row-wise and x already sharded to match."""
 
-    _tensor_parallel_sharded_parameters = frozenset({"weight"})
-
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(
+        self, in_features: int, out_features: int, ctx: ParallelContext, bias: bool = True
+    ):
         super().__init__()
-        world_size = ps.get_tensor_parallel_world_size()
-        self.in_features = in_features
-        self.in_features_local = divide(in_features, world_size)
-        self.out_features = out_features
+        self.ctx = ctx
+        self.in_features_local = divide(in_features, ctx.tp_size)
 
         self.weight = nn.Parameter(torch.empty(self.in_features_local, out_features))
         # The bias is replicated, so add it after the all-reduce -- adding it
         # before would scale it by the TP world size.
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.weight.tensor_parallel_sharded = True
         nn.init.normal_(self.weight, std=0.02)
 
-    def forward(self, x):
+    def forward(self, x, *, sequence_parallel=False):
         y = x @ self.weight
-        # g: all-reduce the partial sums; gradient flows straight through.
-        y = reduce_from_tensor_parallel_region(y)
+        if sequence_parallel:
+            y = reduce_scatter_to_sequence_parallel_region(y, self.ctx)
+        else:
+            # g: all-reduce the partial sums; gradient flows straight through.
+            y = reduce_from_tensor_parallel_region(y, self.ctx)
         return y + self.bias if self.bias is not None else y
 
 
@@ -93,24 +95,25 @@ class VocabParallelEmbedding(nn.Module):
     fills them in from whichever rank owns them.
     """
 
-    _tensor_parallel_sharded_parameters = frozenset({"weight"})
-
-    def __init__(self, num_embeddings, embedding_dim):
+    def __init__(
+        self, num_embeddings: int, embedding_dim: int, ctx: ParallelContext
+    ):
         super().__init__()
-        world_size = ps.get_tensor_parallel_world_size()
-        rank = ps.get_tensor_parallel_rank()
-        per_partition = divide(num_embeddings, world_size)
+        self.ctx = ctx
+        per_partition = divide(num_embeddings, ctx.tp_size)
 
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.vocab_start = rank * per_partition
+        self.vocab_start = ctx.tp_rank * per_partition
         self.vocab_end = self.vocab_start + per_partition
 
         self.weight = nn.Parameter(torch.empty(per_partition, embedding_dim))
+        self.weight.tensor_parallel_sharded = True
         nn.init.normal_(self.weight, std=0.02)
 
-    def forward(self, input_ids):
-        if ps.get_tensor_parallel_world_size() > 1:
+    def forward(self, input_ids, *, sequence_parallel=False):
+        vocab_size = self.ctx.tp_size * (self.vocab_end - self.vocab_start)
+        if torch.any(input_ids < 0) or torch.any(input_ids >= vocab_size):
+            raise ValueError("input token id is outside the model vocabulary")
+        if self.ctx.tp_size > 1:
             mask = (input_ids < self.vocab_start) | (input_ids >= self.vocab_end)
             local_ids = (input_ids - self.vocab_start).clone()
             local_ids[mask] = 0
@@ -122,42 +125,8 @@ class VocabParallelEmbedding(nn.Module):
         if mask is not None:
             y = y.clone()
             y[mask, :] = 0.0
-            y = reduce_from_tensor_parallel_region(y)
+            if sequence_parallel:
+                y = reduce_scatter_to_sequence_parallel_region(y, self.ctx)
+            else:
+                y = reduce_from_tensor_parallel_region(y, self.ctx)
         return y
-
-
-def set_tensor_parallel_attributes(model: nn.Module) -> None:
-    """Tag parameters so the gradient sync knows which ones are replicated.
-
-    LayerNorm/RMSNorm weights and row-parallel biases exist identically on every
-    TP rank. Their gradients happen to be identical too (the inputs are), so no
-    extra all-reduce is needed here -- but the tag is what a sequence-parallel
-    or optimizer-sharding extension would key off.
-    """
-    # Reset first, then mark in a second pass. A parameter can be shared by two
-    # modules (the tied embedding / LM head is the important case), so a module
-    # that sees it later must never overwrite an earlier ``True`` with ``False``.
-    for param in model.parameters():
-        param.tensor_parallel_sharded = False
-
-    for module in model.modules():
-        sharded_names = getattr(module, "_tensor_parallel_sharded_parameters", ())
-        for name, param in module.named_parameters(recurse=False):
-            if name in sharded_names:
-                param.tensor_parallel_sharded = True
-
-
-def all_reduce_replicated_gradients(model: nn.Module) -> None:
-    """Sync gradients of TP-replicated parameters.
-
-    A no-op mathematically in this implementation (identical inputs give
-    identical gradients), but it removes any drift from non-determinism and
-    documents where sequence parallelism would need real communication.
-    """
-    if ps.get_tensor_parallel_world_size() == 1:
-        return
-    group = ps.get_tensor_parallel_group()
-    for param in model.parameters():
-        if param.grad is not None and not getattr(param, "tensor_parallel_sharded", False):
-            dist.all_reduce(param.grad, group=group)
-            param.grad /= ps.get_tensor_parallel_world_size()

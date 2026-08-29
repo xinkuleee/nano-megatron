@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import torch
 
-from . import parallel_state as ps
-from .model import GPT, GPTConfig, layers_for_stage
+from nano_megatron.model import GPT, GPTConfig, layers_for_stage
+from nano_megatron.parallel import ParallelContext
 
 # parameter-name suffix -> dim of the *reference* (unsharded) tensor to split.
 # Anything not listed is replicated across the TP group.
@@ -37,16 +37,15 @@ def _shard_dim_for(name: str) -> int | None:
 def build_reference_model(config: GPTConfig, seed: int = 0) -> GPT:
     """A complete, unsharded model -- the ground truth to compare against."""
     torch.manual_seed(seed)
-    with ps.single_rank_context():
-        return GPT(config)
+    return GPT(config, ParallelContext.single())
 
 
-def shard_state_dict(reference: GPT, config: GPTConfig) -> dict[str, torch.Tensor]:
+def shard_state_dict(
+    reference: GPT, config: GPTConfig, ctx: ParallelContext
+) -> dict[str, torch.Tensor]:
     """Extract this rank's slice of the reference weights."""
-    tp_size = ps.get_tensor_parallel_world_size()
-    tp_rank = ps.get_tensor_parallel_rank()
-    pp_size = ps.get_pipeline_parallel_world_size()
-    pp_rank = ps.get_pipeline_parallel_rank()
+    tp_size, tp_rank = ctx.tp_size, ctx.tp_rank
+    pp_size, pp_rank = ctx.pp_size, ctx.pp_rank
 
     start, end = layers_for_stage(config.n_layer, pp_size, pp_rank)
     reference_state = reference.state_dict()
@@ -61,11 +60,11 @@ def shard_state_dict(reference: GPT, config: GPTConfig) -> dict[str, torch.Tenso
                 continue
             local_name = f"layers.{index - start}.{rest}"
         elif name.startswith("embedding."):
-            if not ps.is_pipeline_first_stage():
+            if not ctx.is_first_stage:
                 continue
             local_name = name
         elif name.startswith(("lm_head.", "final_norm.")):
-            if not ps.is_pipeline_last_stage():
+            if not ctx.is_last_stage:
                 continue
             local_name = name
         else:
@@ -80,10 +79,14 @@ def shard_state_dict(reference: GPT, config: GPTConfig) -> dict[str, torch.Tenso
     return sharded
 
 
-def build_parallel_model(config: GPTConfig, reference: GPT) -> GPT:
+def build_parallel_model(
+    config: GPTConfig, reference: GPT, ctx: ParallelContext
+) -> GPT:
     """Construct this rank's stage and load its slice of the reference."""
-    model = GPT(config)
-    missing, unexpected = model.load_state_dict(shard_state_dict(reference, config), strict=False)
+    model = GPT(config, ctx)
+    missing, unexpected = model.load_state_dict(
+        shard_state_dict(reference, config, ctx), strict=False
+    )
     unexpected = [k for k in unexpected if not k.startswith("rope_")]
     if unexpected:
         raise RuntimeError(f"unexpected keys when sharding: {unexpected}")
@@ -98,7 +101,7 @@ def gather_full_gradient(name: str, model: GPT, config: GPTConfig) -> torch.Tens
     param = dict(model.named_parameters()).get(name)
     if param is None or param.grad is None:
         return None
-    return _gather_tensor(name, param.grad)
+    return _gather_tensor(name, param.grad, model.ctx)
 
 
 def gather_full_parameter(name: str, model: GPT) -> torch.Tensor | None:
@@ -106,17 +109,17 @@ def gather_full_parameter(name: str, model: GPT) -> torch.Tensor | None:
     param = dict(model.named_parameters()).get(name)
     if param is None:
         return None
-    return _gather_tensor(name, param.data)
+    return _gather_tensor(name, param.data, model.ctx)
 
 
-def _gather_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
+def _gather_tensor(name: str, tensor: torch.Tensor, ctx: ParallelContext) -> torch.Tensor:
     import torch.distributed as dist
 
     dim = _shard_dim_for(name)
-    tp_size = ps.get_tensor_parallel_world_size()
+    tp_size = ctx.tp_size
     if dim is None or tp_size == 1:
         return tensor.clone()
 
     shards = [torch.empty_like(tensor) for _ in range(tp_size)]
-    dist.all_gather(shards, tensor.contiguous(), group=ps.get_tensor_parallel_group())
+    dist.all_gather(shards, tensor.contiguous(), group=ctx.tp_group)
     return torch.cat(shards, dim=dim)

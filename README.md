@@ -1,169 +1,133 @@
 # nano-megatron
 
-Tensor, pipeline, and data parallelism, implemented from scratch in a compact
-Python codebase and verified against a single-process reference.
+A compact implementation of Megatron's defining training path: tensor and
+sequence parallel Transformer layers, non-interleaved 1F1B pipeline parallelism,
+and data-parallel gradient reduction. The implementation is pure PyTorch and is
+verified numerically against an unsharded single-process model on CPU/Gloo.
 
-Pure Python. No CUDA, no C++, no NCCL source. The parallelism lives entirely in
-*orchestration* — which ranks form a group, which slice of a weight each holds,
-what order microbatches execute in — while the actual work stays in PyTorch's
-existing GEMM and collective kernels. That split is the point: it is what makes
-Megatron's core ideas fit in a file you can read in one sitting.
+This is a teaching system, not a smaller copy of Megatron-Core. It keeps the
+communication and scheduling algorithms and deliberately leaves out production
+feature breadth, compatibility layers, and custom GPU kernels.
+
+## Implemented
+
+- Orthogonal TP × PP × DP process groups in an explicit `ParallelContext`
+- Column/row-parallel linear layers and attention-head/MLP sharding
+- Vocab-parallel embedding, LM head, and cross entropy without full-logit gather
+- Sequence Parallel residual stream using sequence AllGather/ReduceScatter
+- Non-interleaved 1F1B with explicit activation/gradient P2P
+- Flat data-parallel gradient reduction, tied embeddings, and logical grad norm
+- Whole-block activation recomputation
+- FP32 and BF16 compute paths (BF16 smoke-tested on CPU; NCCL remains unverified)
+- Deterministic uint16/uint32 pre-tokenized token streams
+- Atomic rank-local checkpoint/resume for an unchanged topology
+- Standard `torchrun` entry point for CPU/Gloo and GPU/NCCL
 
 ## Quick start
 
 ```bash
-uv sync
-```
-
-```bash
+uv sync --group dev
 ./run_checks.sh
 ```
 
-```bash
-uv run python -m nano_megatron.train --tp 2 --pp 2 --steps 20
-```
-
-Everything runs on CPU with the `gloo` backend, so a laptop is enough to develop
-and validate against. Pass `--backend nccl --device cuda` on a real GPU box.
-
-## What's here
-
-| File | Lines | What it does |
-|---|---|---|
-| [`parallel_state.py`](nano_megatron/parallel_state.py) | 201 | Carves the world into orthogonal TP/PP/DP groups |
-| [`mappings.py`](nano_megatron/mappings.py) | 111 | The conjugate `f`/`g` autograd pair — the heart of TP |
-| [`tp_layers.py`](nano_megatron/tp_layers.py) | 163 | Column/Row parallel linear, vocab-parallel embedding |
-| [`cross_entropy.py`](nano_megatron/cross_entropy.py) | 76 | Loss over sharded logits without ever gathering them |
-| [`model.py`](nano_megatron/model.py) | 220 | GPT where each stage builds only its own layers |
-| [`p2p.py`](nano_megatron/p2p.py) | 84 | Stage-to-stage send/recv |
-| [`schedules.py`](nano_megatron/schedules.py) | 154 | GPipe and 1F1B |
-| | **1,168** | parallelism and model core (comments included) |
-| [`sharding.py`](nano_megatron/sharding.py) | 122 | Sharding rules in one place, used by the tests |
-| [`train.py`](nano_megatron/train.py) | 159 | Training loop |
-| [`grads.py`](nano_megatron/grads.py) | 153 | DP/tied gradients, parameter sync, global grad norm |
-
-## Tensor parallelism
-
-Two conjugate autograd functions do all the work:
-
-```
-f  (copy_to_tensor_parallel_region)     forward: identity     backward: all-reduce
-g  (reduce_from_tensor_parallel_region) forward: all-reduce   backward: identity
-```
-
-A column-parallel linear is `f → local matmul`. A row-parallel linear is
-`local matmul → g`. Chain them with a nonlinearity in between and the
-nonlinearity needs no communication at all, because each rank's slice of the
-hidden dimension is self-contained:
-
-$$\text{silu}(XA)B = \sum_i \text{silu}(XA_i)B_i$$
-
-One all-reduce per MLP, one per attention block. Autograd derives every backward
-collective for free — that's why `f` and `g` are the only communication code in
-the whole TP path.
-
-Attention shards over heads, which are independent by construction, so
-everything between the QKV projections and the output projection is local.
-
-**Q/K/V are three separate projections here, not one fused GEMM.** Fusing them
-shards wrong: chunking `[q|k|v]` along the output dim gives rank 0 all of `q`
-plus half of `k`, not a slice of each head. Megatron does fuse, but pays for it
-with a per-shard interleaved weight layout. Correctness first.
-
-**The loss never materialises full logits.** A `[b, s, V]` all-gather would
-dwarf every other collective in the model. Instead the two reductions softmax
-actually needs — a max and a sum — happen on `[b, s]` tensors, which is
-`O(b·s)` traffic instead of `O(b·s·V)`.
-
-## Pipeline parallelism
-
-The scheduler *is* the pipeline parallelism. There is no runtime, no queue, no
-thread pool. Each rank runs an ordinary single-threaded loop:
-
-```python
-for _ in range(num_steady):
-    hidden = recv_forward(...)              # blocks until upstream sends
-    output = forward_step(...)
-    grad = send_forward_recv_backward(...)  # one exchange, two jobs
-    backward_step(...)
-    send_backward(...)
-```
-
-The pipelining effect emerges from different processes sitting at different
-points in that loop. The blocking receive is the only synchronisation needed.
-
-GPipe and 1F1B run the *same two step functions in a different order*:
-
-|  | Bubble | Activations held |
-|---|---|---|
-| GPipe | `(P-1)/M` | `M` |
-| 1F1B | `(P-1)/M` | `P - rank` |
-
-Identical bubble. The entire win is activation memory — and it costs nothing but
-reordering. Model code is untouched between the two.
-
-## Verification
-
-Correctness is the deliverable, so it is checked four ways.
-
-**Sharding invariants** ([`tests/check_sharding.py`](tests/check_sharding.py)) —
-every parameter has an explicit shard rule, chunk/concat round-trips exactly,
-stages cover every layer exactly once.
-
-**TP algebra** ([`tests/check_tp_math.py`](tests/check_tp_math.py)) — simulates
-a TP group inside one process with collectives stubbed out, then proves
-column×row reconstructs the full MLP, that sharded gradients concatenate to the
-reference, and that the vocab-parallel loss and its gradient match
-`F.cross_entropy`.
-
-**Logical gradient norm** ([`tests/check_grad_clip.py`](tests/check_grad_clip.py)) —
-checks TP-shard summation, replicated-parameter deduplication, PP-stage
-summation, tied-weight deduplication, and verifies that DP replicas are not
-counted twice.
-
-**End-to-end** ([`tests/check_parallel.py`](tests/check_parallel.py)) — the real
-one. Builds a full single-process model, shards it, runs both schedules under
-real processes, and asserts the loss, every reassembled gradient, the global
-gradient norm, clipped gradients, and parameters after one optimizer step all match
-elementwise. DP replicas deliberately consume different batches so their
-all-reduce cannot pass by averaging already-identical gradients:
+Run a four-process synthetic training example:
 
 ```bash
-python -m tests.check_parallel --matrix
+torchrun --nproc-per-node=4 -m nano_megatron.train \
+  --tp 2 --pp 2 --sequence-parallel --recompute --steps 20
 ```
 
-sweeping TP, PP, DP, combined 3-D configurations, both schedules, and the
-`num_microbatches < pp` boundary case. Split pipelines also exercise tied input
-and output embeddings.
+On macOS, if `--standalone` resolves an invalid local IPv6 hostname, use an
+explicit loopback rendezvous:
 
-Loss is divided by the microbatch count so gradient accumulation reproduces one
-large batch exactly — that equivalence is what makes the comparison meaningful.
+```bash
+torchrun --nnodes=1 --nproc-per-node=4 \
+  --master-addr=127.0.0.1 --master-port=29500 \
+  -m nano_megatron.train --tp 2 --pp 2 --sequence-parallel
+```
 
-### Current status
+For a pre-tokenized stream, pass a flat native-endian uint16 or uint32 file:
 
-Sharding, TP-math, and logical-gradient checks pass (7/7, 5/5, and 3/3), and
-the 17-configuration CPU/Gloo distributed matrix passes. `run_checks.sh` fails rather than reporting success when socket
-binding is unavailable, because skipping the distributed matrix is not a
-correctness pass. GPU/NCCL, mixed precision, and performance remain separate
-validation work.
+```bash
+torchrun --nproc-per-node=4 -m nano_megatron.train \
+  --tp 2 --pp 2 --sequence-parallel \
+  --data tokens.bin --data-dtype uint16 \
+  --save checkpoints --save-every 100 --steps 1000
+```
 
-## Deliberate omissions
+Resume from an exact step directory using the same TP/PP/DP topology:
 
-Not oversights — each is a performance optimisation orthogonal to the parallelism
-itself, and leaving them out is why the core stays readable:
+```bash
+torchrun --nproc-per-node=4 -m nano_megatron.train \
+  --tp 2 --pp 2 --sequence-parallel \
+  --data tokens.bin --load checkpoints/step_00000100 --steps 1000
+```
 
-- **Interleaved 1F1B** — divides the bubble by `v`; needs virtual stages
-- **Sequence parallelism** — the natural next step; splits each all-reduce into
-  reduce-scatter + all-gather for the same traffic and `1/tp` the activation memory
-- **Communication/computation overlap** — bucketed gradient all-reduce; the
-  single biggest real-world throughput win
-- **ZeRO optimizer sharding**, activation recomputation, FP8, MoE
-- **Dropout** — correct TP dropout needs two RNG states (different seeds inside
-  the parallel region, identical outside). Omitted rather than done wrong.
+For NVIDIA GPUs add `--backend nccl --device cuda --dtype bfloat16`. The CUDA
+device is bound from `LOCAL_RANK` before any NCCL process group is created.
 
-## Notes
+## Architecture
 
-Dividing `world_size` as `(pp, dp, tp)` with `tp` varying fastest keeps each TP
-group contiguous. On real hardware that lands the chatty all-reduces on
-intra-node NVLink and leaves PP — small point-to-point messages — on the slow
-outer axis. It is the reason `tp_size` should not exceed one node.
+| File | Responsibility |
+|---|---|
+| `parallel.py` | Rank coordinates and TP/PP/DP/tied process groups |
+| `mappings.py` | Autograd-aware AllReduce, sequence AllGather, ReduceScatter |
+| `tp_layers.py` | Column/row linear and vocab-parallel embedding |
+| `cross_entropy.py` | Cross entropy over vocabulary-sharded logits |
+| `model.py` | One decoder-only GPT stage: RMSNorm, RoPE, MHA, SwiGLU |
+| `pipeline.py` | P2P communication and the single non-interleaved 1F1B schedule |
+| `grads.py` | TP/SP/tied/DP gradient finalization and global clipping |
+| `data.py` | Minimal pre-tokenized token stream |
+| `checkpoint.py` | Atomic same-topology rank-local checkpointing |
+| `train.py` | Thin torchrun CLI and training loop |
+
+Each rank owns coordinates `(pp_rank, dp_rank, tp_rank)` with:
+
+$$W = PP \times DP \times TP$$
+
+Tensor-parallel ranks split layer weights. Sequence Parallel reuses the TP group
+and keeps the residual stream as `[B, S/TP, H]`: each sublayer AllGathers the
+sequence before its column-parallel projections and ReduceScatters the row-
+parallel output. PP ranks own consecutive Transformer blocks and exchange only
+activation shards and their gradients. DP replicas consume different token
+windows and average flat gradient buffers after microbatch accumulation.
+
+The vocabulary-parallel loss communicates only the per-token global maximum,
+exponential sum, and target logit, reducing communication from $O(BSV)$ to
+$O(BS)$.
+
+## Correctness contract
+
+The tests do not treat "the program ran" as correctness. They build an
+unsharded reference model, slice the exact same weights across ranks, and compare:
+
+- loss and every reassembled gradient
+- TP/SP activation shapes
+- logical full-model gradient norm and clipped gradients
+- parameters after an optimizer step
+- heterogeneous DP data and TP×PP×DP composition
+- tied embedding initialization and gradients
+- recomputation on/off results
+- checkpoint model, optimizer, RNG, step, and data-cursor restoration
+
+Run `./run_checks.sh` for the socket-free algebra checks, real SP collectives,
+and the CPU/Gloo distributed matrix. The script fails if distributed checks
+cannot run rather than reporting a skipped matrix as success.
+
+The end-to-end CLI test also compares uninterrupted training with a four-rank
+`torchrun` save/restart/resume run under TP=2, PP=2, SP, BF16, and recomputation.
+
+## Deliberate non-goals
+
+- MoE/Expert Parallel and Context Parallel
+- ZeRO/FSDP or a distributed optimizer
+- virtual/interleaved pipeline stages or automatic graph partitioning
+- communication/computation overlap and persistent gradient buckets
+- FP8/FP4, Transformer Engine, Triton, or custom CUDA kernels
+- model registries, multiple architectures, tokenizer training, or data cleaning
+- inference serving, KV caches, RL, elastic recovery, async checkpoints
+- checkpoint resharding across a changed topology
+
+These are important production features, but each creates a separate systems
+problem. Keeping them out lets every collective in this repository correspond
+to a visible mathematical reason and keeps the full training step readable.

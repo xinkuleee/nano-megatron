@@ -1,6 +1,13 @@
-"""nano-megatron: tensor and pipeline parallelism, small enough to read."""
+"""Megatron's TP, SP, PP, and DP training core, small enough to read."""
 
 from .model import GPT, GPTConfig
-from .schedules import get_forward_backward_func
+from .parallel import ParallelContext, init_parallel
+from .pipeline import forward_backward_1f1b
 
-__all__ = ["GPT", "GPTConfig", "get_forward_backward_func"]
+__all__ = [
+    "GPT",
+    "GPTConfig",
+    "ParallelContext",
+    "init_parallel",
+    "forward_backward_1f1b",
+]

@@ -1,4 +1,4 @@
-"""The communication primitives of tensor parallelism.
+"""Autograd-aware tensor- and sequence-parallel collectives.
 
 Everything TP does rests on two conjugate autograd functions:
 
@@ -12,100 +12,141 @@ A column-parallel linear is ``f -> local matmul``; a row-parallel linear is
 between needs no communication at all, and autograd derives every backward
 collective for free. That is the whole trick.
 
-The scatter/gather pair is the sequence-parallel variant, kept here because it
-makes the identity ``all_reduce == reduce_scatter + all_gather`` explicit.
+Sequence parallelism keeps the residual stream sharded as ``[B, S/tp, H]``.
+Before a column-parallel projection the sequence is all-gathered; after the
+matching row-parallel projection a SUM reduce-scatter restores the shard.  The
+backward methods are the mathematical adjoints of those forward collectives.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.distributed as dist
 
-from . import parallel_state as ps
+from .parallel import ParallelContext
 
 
-def _all_reduce(tensor: torch.Tensor) -> torch.Tensor:
-    if ps.get_tensor_parallel_world_size() == 1:
+def _all_reduce(
+    tensor: torch.Tensor, group: dist.ProcessGroup | None, world_size: int
+) -> torch.Tensor:
+    if world_size == 1:
         return tensor
-    dist.all_reduce(tensor, group=ps.get_tensor_parallel_group())
+    dist.all_reduce(tensor, group=group)
     return tensor
 
 
-def _split_last_dim(tensor: torch.Tensor) -> torch.Tensor:
-    world_size = ps.get_tensor_parallel_world_size()
-    if world_size == 1:
-        return tensor
-    chunks = torch.chunk(tensor, world_size, dim=-1)
-    return chunks[ps.get_tensor_parallel_rank()].contiguous()
+def _check_sequence_tensor(tensor: torch.Tensor) -> None:
+    if tensor.ndim < 2:
+        raise ValueError(f"sequence-parallel tensor needs at least 2 dims, got {tensor.shape}")
 
 
-def _gather_last_dim(tensor: torch.Tensor) -> torch.Tensor:
-    world_size = ps.get_tensor_parallel_world_size()
+def _all_gather_sequence(
+    tensor: torch.Tensor, group: dist.ProcessGroup | None, world_size: int
+) -> torch.Tensor:
+    """All-gather batch-first sequence shards in TP-rank order."""
     if world_size == 1:
         return tensor
-    tensor = tensor.contiguous()
-    buffers = [torch.empty_like(tensor) for _ in range(world_size)]
-    dist.all_gather(buffers, tensor, group=ps.get_tensor_parallel_group())
-    return torch.cat(buffers, dim=-1)
+    _check_sequence_tensor(tensor)
+    sequence_first = tensor.transpose(0, 1).contiguous()
+    output = torch.empty(
+        (sequence_first.size(0) * world_size, *sequence_first.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    gather = getattr(dist, "all_gather_single", dist.all_gather_into_tensor)
+    gather(output, sequence_first, group=group)
+    return output.transpose(0, 1).contiguous()
+
+
+def _reduce_scatter_sequence(
+    tensor: torch.Tensor, group: dist.ProcessGroup | None, world_size: int
+) -> torch.Tensor:
+    """SUM partial full-sequence tensors and scatter dim 1 across TP ranks."""
+    if world_size == 1:
+        return tensor
+    _check_sequence_tensor(tensor)
+    if tensor.size(1) % world_size:
+        raise ValueError(
+            f"sequence length {tensor.size(1)} is not divisible by TP size {world_size}"
+        )
+    sequence_first = tensor.transpose(0, 1).contiguous()
+    output = torch.empty(
+        (sequence_first.size(0) // world_size, *sequence_first.shape[1:]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    reduce_scatter = getattr(dist, "reduce_scatter_single", dist.reduce_scatter_tensor)
+    reduce_scatter(output, sequence_first, op=dist.ReduceOp.SUM, group=group)
+    return output.transpose(0, 1).contiguous()
 
 
 class _CopyToTensorParallelRegion(torch.autograd.Function):
     """f: identity forward, all-reduce backward."""
 
     @staticmethod
-    def forward(ctx, x):
+    def forward(ctx, x, group, world_size):
+        ctx.group = group
+        ctx.world_size = world_size
         return x
 
     @staticmethod
     def backward(ctx, grad):
-        return _all_reduce(grad)
+        return _all_reduce(grad, ctx.group, ctx.world_size), None, None
 
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
     """g: all-reduce forward, identity backward."""
 
     @staticmethod
-    def forward(ctx, x):
-        return _all_reduce(x)
+    def forward(ctx, x, group, world_size):
+        return _all_reduce(x, group, world_size)
 
     @staticmethod
     def backward(ctx, grad):
-        return grad
+        return grad, None, None
 
 
-class _ScatterToTensorParallelRegion(torch.autograd.Function):
-    """Keep this rank's shard of the last dim; all-gather on the way back."""
-
-    @staticmethod
-    def forward(ctx, x):
-        return _split_last_dim(x)
+class _GatherFromSequenceParallelRegion(torch.autograd.Function):
+    """All-gather sequence forward; SUM reduce-scatter backward."""
 
     @staticmethod
-    def backward(ctx, grad):
-        return _gather_last_dim(grad)
-
-
-class _GatherFromTensorParallelRegion(torch.autograd.Function):
-    """Rebuild the full last dim; drop back to this rank's shard on the way back."""
-
-    @staticmethod
-    def forward(ctx, x):
-        return _gather_last_dim(x)
+    def forward(ctx, x, group, world_size):
+        ctx.group = group
+        ctx.world_size = world_size
+        return _all_gather_sequence(x, group, world_size)
 
     @staticmethod
     def backward(ctx, grad):
-        return _split_last_dim(grad)
+        return _reduce_scatter_sequence(grad, ctx.group, ctx.world_size), None, None
 
 
-def copy_to_tensor_parallel_region(x):
-    return _CopyToTensorParallelRegion.apply(x)
+class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
+    """SUM reduce-scatter sequence forward; all-gather backward."""
+
+    @staticmethod
+    def forward(ctx, x, group, world_size):
+        ctx.group = group
+        ctx.world_size = world_size
+        return _reduce_scatter_sequence(x, group, world_size)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return _all_gather_sequence(grad, ctx.group, ctx.world_size), None, None
 
 
-def reduce_from_tensor_parallel_region(x):
-    return _ReduceFromTensorParallelRegion.apply(x)
+def copy_to_tensor_parallel_region(x: torch.Tensor, ctx: ParallelContext) -> torch.Tensor:
+    return _CopyToTensorParallelRegion.apply(x, ctx.tp_group, ctx.tp_size)
 
 
-def scatter_to_tensor_parallel_region(x):
-    return _ScatterToTensorParallelRegion.apply(x)
+def reduce_from_tensor_parallel_region(x: torch.Tensor, ctx: ParallelContext) -> torch.Tensor:
+    return _ReduceFromTensorParallelRegion.apply(x, ctx.tp_group, ctx.tp_size)
 
 
-def gather_from_tensor_parallel_region(x):
-    return _GatherFromTensorParallelRegion.apply(x)
+def gather_from_sequence_parallel_region(x: torch.Tensor, ctx: ParallelContext) -> torch.Tensor:
+    return _GatherFromSequenceParallelRegion.apply(x, ctx.tp_group, ctx.tp_size)
+
+
+def reduce_scatter_to_sequence_parallel_region(
+    x: torch.Tensor, ctx: ParallelContext
+) -> torch.Tensor:
+    return _ReduceScatterToSequenceParallelRegion.apply(x, ctx.tp_group, ctx.tp_size)

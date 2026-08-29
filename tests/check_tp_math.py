@@ -1,10 +1,8 @@
-"""Simulate a TP group inside one process, with no sockets involved.
+"""Check TP algebra rank by rank without creating process groups.
 
-The parallel-state getters are overridden rank by rank and the collectives are
-replaced with plain tensor math -- an all-reduce over a simulated group is just
-a sum over the per-rank results. That is enough to prove the sharding algebra:
-that column-then-row really reconstructs the full matmul, and that the
-vocab-parallel loss matches a normal cross entropy.
+Each simulated rank receives an explicit topology context. Partial tensor math
+is combined by the test, which is enough to prove that column/row sharding
+reconstructs the full matmul and vocab sharding reconstructs cross entropy.
 
 It cannot prove the schedules or the real collectives are right; only
 ``check_parallel.py`` under real processes does that.
@@ -14,39 +12,23 @@ It cannot prove the schedules or the real collectives are right; only
 
 from __future__ import annotations
 
-import contextlib
-
 import torch
 import torch.nn.functional as F
 
-from nano_megatron import mappings, parallel_state as ps
+from nano_megatron import mappings
+from nano_megatron.parallel import ParallelContext
 from nano_megatron.tp_layers import ColumnParallelLinear, RowParallelLinear
 
 TOLERANCE = dict(rtol=1e-5, atol=1e-6)
 
 
-@contextlib.contextmanager
 def simulated_rank(tp_size, tp_rank):
-    """Make the library believe it is ``tp_rank`` of ``tp_size``.
-
-    Collectives become no-ops: each simulated rank computes its own partial
-    result and the test sums them explicitly, which is exactly what a real
-    all-reduce would do.
-    """
-    saved = {
-        "world": ps.get_tensor_parallel_world_size,
-        "rank": ps.get_tensor_parallel_rank,
-        "all_reduce": mappings._all_reduce,
-    }
-    ps.get_tensor_parallel_world_size = lambda: tp_size
-    ps.get_tensor_parallel_rank = lambda: tp_rank
-    mappings._all_reduce = lambda tensor: tensor
-    try:
-        yield
-    finally:
-        ps.get_tensor_parallel_world_size = saved["world"]
-        ps.get_tensor_parallel_rank = saved["rank"]
-        mappings._all_reduce = saved["all_reduce"]
+    """A topology-only context for algebra checked without collectives."""
+    return ParallelContext(
+        rank=tp_rank, world_size=tp_size, tp_size=tp_size, tp_rank=tp_rank,
+        pp_size=1, pp_rank=0, dp_size=1, dp_rank=0,
+        tp_ranks=tuple(range(tp_size)), pp_ranks=(tp_rank,), dp_ranks=(tp_rank,),
+    )
 
 
 def check_column_row_pair_reconstructs_mlp():
@@ -67,12 +49,13 @@ def check_column_row_pair_reconstructs_mlp():
     for tp_size in (2, 4):
         partial_sum = torch.zeros(batch, out_dim)
         for tp_rank in range(tp_size):
-            with simulated_rank(tp_size, tp_rank):
-                column = ColumnParallelLinear(in_dim, hidden, bias=False)
-                row = RowParallelLinear(hidden, out_dim, bias=False)
-                column.weight.data = torch.chunk(A, tp_size, dim=1)[tp_rank].clone()
-                row.weight.data = torch.chunk(B, tp_size, dim=0)[tp_rank].clone()
-                partial_sum = partial_sum + row(F.silu(column(x)))
+            ctx = simulated_rank(tp_size, tp_rank)
+            column = ColumnParallelLinear(in_dim, hidden, ctx, bias=False)
+            row = RowParallelLinear(hidden, out_dim, ctx, bias=False)
+            column.weight.data = torch.chunk(A, tp_size, dim=1)[tp_rank].clone()
+            row.weight.data = torch.chunk(B, tp_size, dim=0)[tp_rank].clone()
+            hidden_local = F.silu(column(x, reduce_input_grad=False))
+            partial_sum = partial_sum + hidden_local @ row.weight
 
         error = (partial_sum - expected).abs().max().item()
         assert torch.allclose(partial_sum, expected, **TOLERANCE), (
@@ -94,11 +77,11 @@ def check_column_shard_gradients_concatenate():
     tp_size = 4
     shards = []
     for tp_rank in range(tp_size):
-        with simulated_rank(tp_size, tp_rank):
-            column = ColumnParallelLinear(in_dim, out_dim, bias=False)
-            column.weight.data = torch.chunk(A.detach(), tp_size, dim=1)[tp_rank].clone()
-            column(x).pow(2).sum().backward()
-            shards.append(column.weight.grad)
+        ctx = simulated_rank(tp_size, tp_rank)
+        column = ColumnParallelLinear(in_dim, out_dim, ctx, bias=False)
+        column.weight.data = torch.chunk(A.detach(), tp_size, dim=1)[tp_rank].clone()
+        column(x, reduce_input_grad=False).pow(2).sum().backward()
+        shards.append(column.weight.grad)
 
     rebuilt = torch.cat(shards, dim=1)
     error = (rebuilt - expected_grad).abs().max().item()
@@ -132,15 +115,12 @@ def check_vocab_parallel_cross_entropy():
             end = start + per_partition
             shard = logits[..., start:end]
 
-            with simulated_rank(tp_size, tp_rank):
-                shard_max.append(shard.max(dim=-1)[0])
-                # Mask targets this rank does not own, exactly as the real
-                # implementation does before its all-reduce.
-                owned = (labels >= start) & (labels < end)
-                local = (labels - start).clamp(0, per_partition - 1)
-                picked = shard.gather(-1, local.unsqueeze(-1)).squeeze(-1)
-                shard_target.append(torch.where(owned, picked, torch.zeros_like(picked)))
-                shard_sum.append(shard)
+            shard_max.append(shard.max(dim=-1)[0])
+            owned = (labels >= start) & (labels < end)
+            local = (labels - start).clamp(0, per_partition - 1)
+            picked = shard.gather(-1, local.unsqueeze(-1)).squeeze(-1)
+            shard_target.append(torch.where(owned, picked, torch.zeros_like(picked)))
+            shard_sum.append(shard)
 
         global_max = torch.stack(shard_max).max(dim=0)[0]
         sum_exp = sum((s - global_max.unsqueeze(-1)).exp().sum(-1) for s in shard_sum)
@@ -167,8 +147,9 @@ def check_vocab_parallel_ce_gradient():
     F.cross_entropy(reference.view(-1, vocab), labels.view(-1)).backward()
 
     parallel = logits.clone().requires_grad_(True)
-    with simulated_rank(1, 0):
-        vocab_parallel_cross_entropy(parallel, labels, 0, vocab).backward()
+    vocab_parallel_cross_entropy(
+        parallel, labels, 0, vocab, ParallelContext.single()
+    ).backward()
 
     error = (parallel.grad - reference.grad).abs().max().item()
     assert torch.allclose(parallel.grad, reference.grad, rtol=1e-4, atol=1e-6), (
@@ -182,15 +163,20 @@ def check_conjugate_functions_are_inverse_shaped():
     torch.manual_seed(0)
     x = torch.randn(4, 8, requires_grad=True)
 
-    with simulated_rank(2, 0):
+    ctx = simulated_rank(2, 0)
+    original = mappings._all_reduce
+    mappings._all_reduce = lambda tensor, _group, _size: tensor
+    try:
         # f: identity forward. g: identity backward. Composing them must be
         # identity in both directions when the all-reduce is stubbed out.
         y = mappings.reduce_from_tensor_parallel_region(
-            mappings.copy_to_tensor_parallel_region(x)
+            mappings.copy_to_tensor_parallel_region(x, ctx), ctx
         )
         assert torch.equal(y, x), "f then g is not identity in forward"
         y.sum().backward()
         assert torch.equal(x.grad, torch.ones_like(x)), "f then g is not identity in backward"
+    finally:
+        mappings._all_reduce = original
 
     return "f and g compose to identity with collectives stubbed"
 
@@ -202,6 +188,11 @@ CHECKS = [
     check_vocab_parallel_ce_gradient,
     check_conjugate_functions_are_inverse_shaped,
 ]
+
+
+def test_tensor_parallel_math_checks():
+    for check in CHECKS:
+        check()
 
 
 def main():

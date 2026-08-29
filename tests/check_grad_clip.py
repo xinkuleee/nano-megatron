@@ -14,7 +14,8 @@ import contextlib
 import torch
 import torch.nn as nn
 
-from nano_megatron import grads, parallel_state as ps
+from nano_megatron import grads
+from nano_megatron.parallel import ParallelContext
 
 TOLERANCE = dict(rtol=1e-6, atol=1e-6)
 
@@ -57,26 +58,23 @@ def _parallel_context(
     """Substitute peer sums for TP/PP collectives on one simulated rank."""
     tp_group, pp_group, dp_group = object(), object(), object()
     calls = []
-    saved = {
-        "tp_size": ps.get_tensor_parallel_world_size,
-        "tp_group": ps.get_tensor_parallel_group,
-        "pp_size": ps.get_pipeline_parallel_world_size,
-        "pp_group": ps.get_pipeline_parallel_group,
-        "dp_size": ps.get_data_parallel_world_size,
-        "dp_group": ps.get_data_parallel_group,
-        "last_stage": ps.is_pipeline_last_stage,
-        "all_reduce": grads.dist.all_reduce,
-    }
-
-    ps.get_tensor_parallel_world_size = lambda: tp_size
-    ps.get_tensor_parallel_group = lambda: tp_group
-    ps.get_pipeline_parallel_world_size = lambda: pp_size
-    ps.get_pipeline_parallel_group = lambda: pp_group
-    # A second DP replica is deliberate: its already-averaged gradients must
-    # not be included again when computing the logical model norm.
-    ps.get_data_parallel_world_size = lambda: 2
-    ps.get_data_parallel_group = lambda: dp_group
-    ps.is_pipeline_last_stage = lambda: pp_rank == pp_size - 1
+    ctx = ParallelContext(
+        rank=pp_rank * tp_size,
+        world_size=tp_size * pp_size * 2,
+        tp_size=tp_size,
+        tp_rank=0,
+        pp_size=pp_size,
+        pp_rank=pp_rank,
+        dp_size=2,
+        dp_rank=0,
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_group=dp_group,
+        tp_ranks=tuple(range(tp_size)),
+        pp_ranks=tuple(i * tp_size for i in range(pp_size)),
+        dp_ranks=(0, tp_size),
+    )
+    original_all_reduce = grads.dist.all_reduce
 
     def fake_all_reduce(tensor, group=None):
         if group is tp_group:
@@ -92,16 +90,9 @@ def _parallel_context(
 
     grads.dist.all_reduce = fake_all_reduce
     try:
-        yield calls
+        yield calls, ctx
     finally:
-        ps.get_tensor_parallel_world_size = saved["tp_size"]
-        ps.get_tensor_parallel_group = saved["tp_group"]
-        ps.get_pipeline_parallel_world_size = saved["pp_size"]
-        ps.get_pipeline_parallel_group = saved["pp_group"]
-        ps.get_data_parallel_world_size = saved["dp_size"]
-        ps.get_data_parallel_group = saved["dp_group"]
-        ps.is_pipeline_last_stage = saved["last_stage"]
-        grads.dist.all_reduce = saved["all_reduce"]
+        grads.dist.all_reduce = original_all_reduce
 
 
 def check_tp_pp_dp_tied_norm_and_scaling():
@@ -124,8 +115,10 @@ def check_tp_pp_dp_tied_norm_and_scaling():
                 pp_rank=pp_rank,
                 tp_peer_contribution=local_squared[pp_rank, 1 - tp_rank],
                 pp_peer_contribution=stage_squared[1 - pp_rank],
-            ) as calls:
-                norm = grads.clip_grad_norm(model, max_norm, tie_embeddings=True)
+            ) as (calls, ctx):
+                norm = grads.clip_grad_norm(
+                    model, ctx, max_norm, tie_embeddings=True
+                )
 
             assert calls == ["tp", "pp"], f"rank {(pp_rank, tp_rank)} collectives: {calls}"
             assert torch.allclose(norm, expected_norm, **TOLERANCE), (
@@ -148,15 +141,17 @@ def check_tied_lm_head_counting_is_conditional():
 
     with _parallel_context(
         tp_size=1, pp_size=2, pp_rank=1, pp_peer_contribution=16.0
-    ):
-        untied_norm = grads.clip_grad_norm(model, 100.0, tie_embeddings=False)
+    ) as (_, ctx):
+        untied_norm = grads.clip_grad_norm(
+            model, ctx, 100.0, tie_embeddings=False
+        )
     assert torch.allclose(untied_norm, torch.tensor(5.0, dtype=torch.float64), **TOLERANCE)
 
     model.lm_head.weight.grad.fill_(3.0)
     with _parallel_context(
         tp_size=1, pp_size=2, pp_rank=1, pp_peer_contribution=16.0
-    ):
-        tied_norm = grads.clip_grad_norm(model, 100.0, tie_embeddings=True)
+    ) as (_, ctx):
+        tied_norm = grads.clip_grad_norm(model, ctx, 100.0, tie_embeddings=True)
     assert torch.allclose(tied_norm, torch.tensor(4.0, dtype=torch.float64), **TOLERANCE)
     return "untied LM head counted; tied last-stage copy deduplicated"
 
@@ -167,22 +162,23 @@ def check_limits_and_empty_gradients():
     model.weight.grad = torch.tensor([3.0, 4.0])
     model.weight.tensor_parallel_sharded = False
 
-    with _parallel_context(tp_size=1, pp_size=1, pp_rank=0):
-        norm = grads.clip_grad_norm(model, 100.0)
+    with _parallel_context(tp_size=1, pp_size=1, pp_rank=0) as (_, ctx):
+        norm = grads.clip_grad_norm(model, ctx, 100.0)
     assert norm.item() == 5.0
     assert torch.equal(model.weight.grad, torch.tensor([3.0, 4.0]))
 
     model.weight.grad = torch.tensor([3.0, 4.0])
-    with _parallel_context(tp_size=1, pp_size=1, pp_rank=0):
-        norm = grads.clip_grad_norm(model, 0.0)
+    with _parallel_context(tp_size=1, pp_size=1, pp_rank=0) as (_, ctx):
+        norm = grads.clip_grad_norm(model, ctx, 0.0)
     assert norm.item() == 5.0
     assert torch.equal(model.weight.grad, torch.zeros(2))
 
     model.weight.grad = None
-    assert grads.clip_grad_norm(model, 1.0).item() == 0.0
+    with _parallel_context(tp_size=1, pp_size=1, pp_rank=0) as (_, ctx):
+        assert grads.clip_grad_norm(model, ctx, 1.0).item() == 0.0
 
     try:
-        grads.clip_grad_norm(model, -1.0)
+        grads.clip_grad_norm(model, ParallelContext.single(), -1.0)
     except ValueError:
         pass
     else:
@@ -195,6 +191,11 @@ CHECKS = [
     check_tied_lm_head_counting_is_conditional,
     check_limits_and_empty_gradients,
 ]
+
+
+def test_gradient_clipping_checks():
+    for check in CHECKS:
+        check()
 
 
 def main():

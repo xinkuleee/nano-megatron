@@ -11,7 +11,6 @@ open ports.
 from __future__ import annotations
 
 import argparse
-import itertools
 import os
 import queue
 import tempfile
@@ -20,24 +19,25 @@ import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import pytest
 
-from nano_megatron import parallel_state as ps
 from nano_megatron.grads import (
     clip_grad_norm,
     finalize_gradients,
     synchronize_model_parameters,
 )
 from nano_megatron.model import GPT, GPTConfig
-from nano_megatron.schedules import get_forward_backward_func
-from nano_megatron.sharding import (
+from nano_megatron.parallel import init_parallel
+from nano_megatron.pipeline import forward_backward_1f1b
+from tests.reference import (
     build_parallel_model,
     build_reference_model,
     gather_full_gradient,
     gather_full_parameter,
 )
-from nano_megatron.tp_layers import set_tensor_parallel_attributes
 
 TOLERANCE = dict(rtol=1e-4, atol=1e-5)
+pytestmark = pytest.mark.distributed
 
 
 def make_batches(config, micro_bs, num_microbatches, seed=1234):
@@ -54,12 +54,11 @@ def make_batches(config, micro_bs, num_microbatches, seed=1234):
 def run_reference(config, batches, loss_scale=1.0):
     """Single-process forward/backward over the same microbatches."""
     reference = build_reference_model(config)
-    with ps.single_rank_context():
-        total = 0.0
-        for inputs, labels in batches:
-            loss = reference(inputs, labels) * loss_scale / len(batches)
-            loss.backward()
-            total = total + loss.detach()
+    total = 0.0
+    for inputs, labels in batches:
+        loss = reference(inputs, labels) * loss_scale / len(batches)
+        loss.backward()
+        total = total + loss.detach()
     return reference, total
 
 
@@ -78,35 +77,34 @@ def tensors_equal_across_group(tensor, group) -> bool:
     return all(torch.equal(copies[0], other) for other in copies[1:])
 
 
-def check_parameter_initialization(config, rank, failures):
+def check_parameter_initialization(config, rank, failures, ctx):
     """Exercise the rank-aware initialization path used by ``train``."""
     torch.manual_seed(10_000 + rank)
-    initialized = GPT(config)
-    set_tensor_parallel_attributes(initialized)
-    synchronize_model_parameters(initialized, tie_embeddings=config.tie_word_embeddings)
+    initialized = GPT(config, ctx)
+    synchronize_model_parameters(
+        initialized, ctx, tie_embeddings=config.tie_word_embeddings
+    )
 
     distinct_tp_shard = False
     for name, param in initialized.named_parameters():
-        if ps.get_data_parallel_world_size() > 1 and not tensors_equal_across_group(
-            param.data, ps.get_data_parallel_group()
+        if ctx.dp_size > 1 and not tensors_equal_across_group(
+            param.data, ctx.dp_group
         ):
             failures.append(f"init {name}: DP replicas differ after synchronization")
 
-        if ps.get_tensor_parallel_world_size() > 1:
-            equal = tensors_equal_across_group(param.data, ps.get_tensor_parallel_group())
+        if ctx.tp_size > 1:
+            equal = tensors_equal_across_group(param.data, ctx.tp_group)
             if getattr(param, "tensor_parallel_sharded", False):
                 distinct_tp_shard = distinct_tp_shard or not equal
             elif not equal:
                 failures.append(f"init {name}: TP-replicated values differ")
 
-    if ps.get_tensor_parallel_world_size() > 1 and not distinct_tp_shard:
+    if ctx.tp_size > 1 and not distinct_tp_shard:
         failures.append("init: every TP shard is identical")
 
-    if ps.get_pipeline_parallel_world_size() > 1 and (
-        ps.is_pipeline_first_stage() or ps.is_pipeline_last_stage()
-    ):
-        tied = initialized.embedding.weight if ps.is_pipeline_first_stage() else initialized.lm_head.weight
-        if not tensors_equal_across_group(tied.data, ps.get_embedding_group()):
+    if ctx.pp_size > 1 and (ctx.is_first_stage or ctx.is_last_stage):
+        tied = initialized.embedding.weight if ctx.is_first_stage else initialized.lm_head.weight
+        if not tensors_equal_across_group(tied.data, ctx.tied_group):
             failures.append("init: tied embedding copies differ across pipeline stages")
 
 
@@ -117,7 +115,7 @@ def check_one_rank(rank, world_size, init_file, args, result_queue):
         rank=rank,
         world_size=world_size,
     )
-    ps.initialize_model_parallel(tp_size=args.tp, pp_size=args.pp)
+    ctx = init_parallel(tp_size=args.tp, pp_size=args.pp)
     device = torch.device("cpu")
 
     config = GPTConfig(
@@ -129,13 +127,15 @@ def check_one_rank(rank, world_size, init_file, args, result_queue):
         # Exercise the real training configuration: split pipelines keep a
         # copy on their first and last stages and explicitly sum its gradient.
         tie_word_embeddings=True,
+        sequence_parallel=args.sequence_parallel,
+        recompute=args.recompute,
     )
 
     # Every model-parallel rank in one DP replica sees the same microbatches,
     # while different DP replicas see deliberately different data.  If the DP
     # all-reduce is missing, grouped incorrectly, or not averaged, the gradient
     # comparison below fails instead of accidentally passing on identical data.
-    dp_rank = ps.get_data_parallel_rank()
+    dp_rank = ctx.dp_rank
     batches = make_batches(
         config, args.micro_batch_size, args.num_microbatches, seed=1234 + dp_rank
     )
@@ -148,17 +148,35 @@ def check_one_rank(rank, world_size, init_file, args, result_queue):
     ]
     reference, reference_loss = run_reference(config, reference_batches)
 
-    model = build_parallel_model(config, reference)
-    set_tensor_parallel_attributes(model)
+    model = build_parallel_model(config, reference, ctx)
 
-    forward_backward = get_forward_backward_func(args.schedule)
-    losses = forward_backward(model, batches, config, device)
-    finalize_gradients(model, tie_embeddings=config.tie_word_embeddings)
+    activation_shapes = []
+    handles = [
+        layer.register_forward_hook(
+            lambda _module, _inputs, output: activation_shapes.append(tuple(output.shape))
+        )
+        for layer in model.layers
+    ]
+    losses = forward_backward_1f1b(model, batches, config, device, ctx)
+    for handle in handles:
+        handle.remove()
+    finalize_gradients(
+        model,
+        ctx,
+        tie_embeddings=config.tie_word_embeddings,
+        sequence_parallel=config.sequence_parallel,
+    )
 
     failures = []
+    expected_sequence = config.seq_len // (args.tp if config.sequence_parallel else 1)
+    if any(shape[1] != expected_sequence for shape in activation_shapes):
+        failures.append(
+            f"activation sequence shapes {[shape[1] for shape in activation_shapes]} "
+            f"!= expected {expected_sequence}"
+        )
 
     # --- loss, checked on the stage that computes it ---
-    if ps.is_pipeline_last_stage():
+    if ctx.is_last_stage:
         parallel_loss = torch.stack(losses).sum()
         # Loss is local to a DP replica. Gradients, unlike the diagnostic loss,
         # are averaged across replicas by ``finalize_gradients``.
@@ -172,7 +190,7 @@ def check_one_rank(rank, world_size, init_file, args, result_queue):
     # --- gradients, reassembled from their shards ---
     reference_parameters = dict(reference.named_parameters())
     reference_grads = {name: p.grad for name, p in reference_parameters.items()}
-    layer_offset = ps.get_pipeline_parallel_rank() * (config.n_layer // args.pp)
+    layer_offset = ctx.pp_rank * (config.n_layer // args.pp)
 
     for name, _ in model.named_parameters():
         full = gather_full_gradient(name, model, config)
@@ -191,7 +209,7 @@ def check_one_rank(rank, world_size, init_file, args, result_queue):
 
     # Compare the norm and clipped gradients against the logical full model.
     reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), args.clip)
-    parallel_norm = clip_grad_norm(model, args.clip, tie_embeddings=True)
+    parallel_norm = clip_grad_norm(model, ctx, args.clip, tie_embeddings=True)
     if not torch.allclose(parallel_norm.float(), reference_norm.float(), **TOLERANCE):
         failures.append(
             f"grad norm: parallel={parallel_norm.item():.6f} "
@@ -226,11 +244,10 @@ def check_one_rank(rank, world_size, init_file, args, result_queue):
             error = (full - expected.data).abs().max().item()
             failures.append(f"updated param {reference_name}: max_abs_err={error:.3e}")
 
-    check_parameter_initialization(config, rank, failures)
+    check_parameter_initialization(config, rank, failures, ctx)
 
-    result_queue.put((rank, ps.describe(), failures))
+    result_queue.put((rank, ctx.describe(), failures))
 
-    ps.destroy_model_parallel()
     dist.destroy_process_group()
 
 
@@ -286,8 +303,7 @@ def run_config(args, verbose=True) -> bool:
                 print(f"      FAIL {failure}")
 
     label = (
-        f"tp={args.tp} pp={args.pp} dp={args.dp} "
-        f"schedule={args.schedule:5s} world={world_size}"
+        f"tp={args.tp} pp={args.pp} dp={args.dp} world={world_size}"
     )
     ok = total_failures == 0 and not crashed and missing_results == 0
     detail = (
@@ -305,7 +321,6 @@ def build_parser():
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--dp", type=int, default=1)
-    parser.add_argument("--schedule", choices=["gpipe", "1f1b"], default="1f1b")
     parser.add_argument("--matrix", action="store_true", help="sweep all configs")
     parser.add_argument("--num-microbatches", type=int, default=4)
     parser.add_argument("--micro-batch-size", type=int, default=2)
@@ -315,6 +330,8 @@ def build_parser():
     parser.add_argument("--vocab-size", type=int, default=128)
     parser.add_argument("--seq-len", type=int, default=16)
     parser.add_argument("--clip", type=float, default=0.25)
+    parser.add_argument("--sequence-parallel", action="store_true")
+    parser.add_argument("--recompute", action="store_true")
     parser.add_argument(
         "--timeout", type=float, default=120.0, help="seconds allowed per configuration"
     )
@@ -327,33 +344,50 @@ def main():
     if not args.matrix:
         raise SystemExit(0 if run_config(args) else 1)
 
-    # (tp, pp, dp, microbatches): heterogeneous DP data, combined 3-D
-    # parallelism, and M < P pipeline boundary cases are all represented.
+    # (tp, pp, dp, microbatches, sequence_parallel, recompute)
     configs = [
-        (1, 1, 1, 4),
-        (2, 1, 1, 4),
-        (4, 1, 1, 4),
-        (1, 2, 1, 4),
-        (2, 2, 1, 4),
-        (1, 4, 1, 4),
-        (1, 4, 1, 1),
-        (1, 1, 2, 4),
-        (2, 1, 2, 4),
-        (1, 2, 2, 4),
-        (2, 2, 2, 2),
+        (1, 1, 1, 4, False, False),
+        (2, 1, 1, 4, False, False),
+        (4, 1, 1, 4, False, False),
+        (1, 2, 1, 4, False, False),
+        (2, 2, 1, 4, False, False),
+        (1, 4, 1, 4, False, False),
+        (1, 4, 1, 1, False, False),
+        (1, 1, 2, 4, False, False),
+        (2, 1, 2, 4, False, False),
+        (1, 2, 2, 4, False, False),
+        (2, 2, 2, 2, False, False),
+        (2, 1, 1, 4, True, False),
+        (4, 1, 1, 4, True, False),
+        (2, 2, 1, 4, True, False),
+        (2, 2, 2, 2, True, False),
+        (2, 2, 1, 2, True, True),
     ]
     results = []
-    for (tp, pp, dp, microbatches), schedule in itertools.product(
-        configs, ["gpipe", "1f1b"]
-    ):
-        if pp == 1 and schedule == "gpipe":
-            continue  # identical to the no-pipelining path
+    for tp, pp, dp, microbatches, sequence_parallel, recompute in configs:
         args.tp, args.pp, args.dp = tp, pp, dp
-        args.num_microbatches, args.schedule = microbatches, schedule
+        args.num_microbatches = microbatches
+        args.sequence_parallel = sequence_parallel
+        args.recompute = recompute
         results.append(run_config(args, verbose=False))
 
     print(f"\n{sum(results)}/{len(results)} configurations passed")
     raise SystemExit(0 if all(results) else 1)
+
+
+def test_distributed_matrix():
+    args = build_parser().parse_args(["--matrix", "--n-embd=32", "--vocab-size=64", "--seq-len=8", "--micro-batch-size=1"] )
+    configs = [
+        (2, 1, 1, False, False),
+        (2, 2, 1, True, False),
+        (2, 2, 2, True, True),
+    ]
+    for tp, pp, dp, sequence_parallel, recompute in configs:
+        args.tp, args.pp, args.dp = tp, pp, dp
+        args.num_microbatches = 2
+        args.sequence_parallel = sequence_parallel
+        args.recompute = recompute
+        assert run_config(args, verbose=False)
 
 
 if __name__ == "__main__":

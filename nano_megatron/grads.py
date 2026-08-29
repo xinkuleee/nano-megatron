@@ -1,4 +1,4 @@
-"""Gradient synchronisation that the schedules do not cover.
+"""Gradient synchronization after pipeline backward completes.
 
 Two things need attention after the backward pass:
 
@@ -10,102 +10,143 @@ Two things need attention after the backward pass:
 import torch
 import torch.distributed as dist
 
-from . import parallel_state as ps
+from .parallel import ParallelContext
 
 
-def all_reduce_data_parallel_gradients(model) -> None:
-    dp_size = ps.get_data_parallel_world_size()
-    if dp_size == 1:
+def all_reduce_replicated_gradients(
+    model, ctx: ParallelContext, *, sequence_parallel: bool = False
+) -> None:
+    """Synchronize parameters that are replicated across TP ranks.
+
+    Without SP every TP rank sees all tokens, so gradients are duplicates and
+    are averaged. With SP they cover disjoint tokens and must remain a SUM.
+    """
+    if ctx.tp_size == 1:
         return
-    group = ps.get_data_parallel_group()
+    for param in model.parameters():
+        if param.grad is not None and not getattr(
+            param, "tensor_parallel_sharded", False
+        ):
+            dist.all_reduce(param.grad, group=ctx.tp_group)
+            if not sequence_parallel:
+                param.grad /= ctx.tp_size
+
+
+def all_reduce_data_parallel_gradients(model, ctx: ParallelContext) -> None:
+    if ctx.dp_size == 1:
+        return
+    buckets: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
     for param in model.parameters():
         if param.grad is not None:
-            dist.all_reduce(param.grad, group=group)
-            param.grad /= dp_size
+            buckets.setdefault((param.grad.device, param.grad.dtype), []).append(param.grad)
+
+    # One collective per dtype/device instead of one per parameter. The flat
+    # buffer is intentionally rebuilt each step: compact, deterministic, and
+    # sufficient before introducing overlap or persistent gradient buckets.
+    for gradients in buckets.values():
+        flat = torch.cat([gradient.reshape(-1) for gradient in gradients])
+        dist.all_reduce(flat, group=ctx.dp_group)
+        flat /= ctx.dp_size
+        offset = 0
+        for gradient in gradients:
+            size = gradient.numel()
+            gradient.copy_(flat[offset : offset + size].view_as(gradient))
+            offset += size
 
 
-def all_reduce_embedding_gradients(model) -> None:
+def all_reduce_embedding_gradients(model, ctx: ParallelContext) -> None:
     """Keep tied embedding / lm_head weights in step across the pipeline.
 
     Only meaningful once weight tying is enabled across stages; with pp_size ==
     1 the two modules are the same object and there is nothing to do.
     """
-    if ps.get_pipeline_parallel_world_size() == 1:
+    if ctx.pp_size == 1:
         return
-    if not (ps.is_pipeline_first_stage() or ps.is_pipeline_last_stage()):
-        return
-
-    group = ps.get_embedding_group()
-    if group is None:
+    if not (ctx.is_first_stage or ctx.is_last_stage):
         return
 
-    if ps.is_pipeline_first_stage():
+    if ctx.tied_group is None:
+        return
+
+    if ctx.is_first_stage:
         weight = getattr(model, "embedding", None)
     else:
         weight = getattr(model, "lm_head", None)
     if weight is None or weight.weight.grad is None:
         return
 
-    dist.all_reduce(weight.weight.grad, group=group)
+    dist.all_reduce(weight.weight.grad, group=ctx.tied_group)
 
 
-def synchronize_tied_embeddings(model) -> None:
+def synchronize_tied_embeddings(model, ctx: ParallelContext) -> None:
     """Give the first-stage embedding and last-stage LM head equal weights.
 
     With pipeline parallelism they are separate ``Parameter`` objects. Their
     initial values must match before summing their gradients can emulate one
     genuinely shared parameter.
     """
-    if ps.get_pipeline_parallel_world_size() == 1:
+    if ctx.pp_size == 1:
         return
-    if not (ps.is_pipeline_first_stage() or ps.is_pipeline_last_stage()):
+    if not (ctx.is_first_stage or ctx.is_last_stage):
         return
 
-    module = getattr(model, "embedding", None) if ps.is_pipeline_first_stage() else getattr(
+    module = getattr(model, "embedding", None) if ctx.is_first_stage else getattr(
         model, "lm_head", None
     )
     if module is None:
         return
     dist.broadcast(
         module.weight.data,
-        src=ps.get_pipeline_first_rank(),
-        group=ps.get_embedding_group(),
+        src=ctx.pp_ranks[0],
+        group=ctx.tied_group,
     )
 
 
-def synchronize_model_parameters(model, tie_embeddings: bool = False) -> None:
+def synchronize_model_parameters(
+    model, ctx: ParallelContext, *, tie_embeddings: bool = False
+) -> None:
     """Make replicated parameters agree after rank-aware initialization."""
-    if ps.get_tensor_parallel_world_size() > 1:
+    if ctx.tp_size > 1:
         for param in model.parameters():
             if not getattr(param, "tensor_parallel_sharded", False):
                 dist.broadcast(
                     param.data,
-                    src=ps.get_tensor_parallel_src_rank(),
-                    group=ps.get_tensor_parallel_group(),
+                    src=ctx.tp_ranks[0],
+                    group=ctx.tp_group,
                 )
 
-    if ps.get_data_parallel_world_size() > 1:
+    if ctx.dp_size > 1:
         for param in model.parameters():
             dist.broadcast(
                 param.data,
-                src=ps.get_data_parallel_src_rank(),
-                group=ps.get_data_parallel_group(),
+                src=ctx.dp_ranks[0],
+                group=ctx.dp_group,
             )
 
     if tie_embeddings:
-        synchronize_tied_embeddings(model)
+        synchronize_tied_embeddings(model, ctx)
 
 
-def finalize_gradients(model, tie_embeddings: bool = False) -> None:
-    from .tp_layers import all_reduce_replicated_gradients
-
-    all_reduce_replicated_gradients(model)
+def finalize_gradients(
+    model,
+    ctx: ParallelContext,
+    *,
+    tie_embeddings: bool = False,
+    sequence_parallel: bool = False,
+) -> None:
+    all_reduce_replicated_gradients(model, ctx, sequence_parallel=sequence_parallel)
     if tie_embeddings:
-        all_reduce_embedding_gradients(model)
-    all_reduce_data_parallel_gradients(model)
+        all_reduce_embedding_gradients(model, ctx)
+    all_reduce_data_parallel_gradients(model, ctx)
 
 
-def clip_grad_norm(model, max_norm: float, tie_embeddings: bool = False) -> torch.Tensor:
+def clip_grad_norm(
+    model,
+    ctx: ParallelContext,
+    max_norm: float,
+    *,
+    tie_embeddings: bool = False,
+) -> torch.Tensor:
     """Clip using the L2 norm of the logical, unsharded model.
 
     Tensor-parallel shards are unique and must be summed; TP-replicated
@@ -121,15 +162,15 @@ def clip_grad_norm(model, max_norm: float, tie_embeddings: bool = False) -> torc
     parameters = list(model.named_parameters())
     device = next((param.device for _, param in parameters), torch.device("cpu"))
 
-    tp_size = ps.get_tensor_parallel_world_size()
+    tp_size = ctx.tp_size
     total_sq = torch.zeros((), dtype=torch.float64, device=device)
     for name, param in parameters:
         if param.grad is None:
             continue
         duplicate_tied_weight = (
             tie_embeddings
-            and ps.get_pipeline_parallel_world_size() > 1
-            and ps.is_pipeline_last_stage()
+            and ctx.pp_size > 1
+            and ctx.is_last_stage
             and name == "lm_head.weight"
         )
         if duplicate_tied_weight:
@@ -141,9 +182,9 @@ def clip_grad_norm(model, max_norm: float, tie_embeddings: bool = False) -> torc
         total_sq += contribution
 
     if tp_size > 1:
-        dist.all_reduce(total_sq, group=ps.get_tensor_parallel_group())
-    if ps.get_pipeline_parallel_world_size() > 1:
-        dist.all_reduce(total_sq, group=ps.get_pipeline_parallel_group())
+        dist.all_reduce(total_sq, group=ctx.tp_group)
+    if ctx.pp_size > 1:
+        dist.all_reduce(total_sq, group=ctx.pp_group)
 
     total_norm = total_sq.sqrt()
     coefficient = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)

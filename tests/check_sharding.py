@@ -12,10 +12,8 @@ from __future__ import annotations
 
 import torch
 
-from nano_megatron import parallel_state as ps
 from nano_megatron.model import GPTConfig, layers_for_stage
-from nano_megatron.sharding import _SHARD_DIM, _shard_dim_for, build_reference_model
-from nano_megatron.tp_layers import set_tensor_parallel_attributes
+from tests.reference import _SHARD_DIM, _shard_dim_for, build_reference_model
 
 CONFIG = GPTConfig(vocab_size=128, n_layer=4, n_head=4, n_embd=64, seq_len=16)
 
@@ -26,9 +24,8 @@ def check_reference_runs():
     inputs = torch.randint(0, CONFIG.vocab_size, (2, CONFIG.seq_len))
     labels = torch.randint(0, CONFIG.vocab_size, (2, CONFIG.seq_len))
 
-    with ps.single_rank_context():
-        loss = model(inputs, labels)
-        loss.backward()
+    loss = model(inputs, labels)
+    loss.backward()
 
     assert torch.isfinite(loss), f"loss is not finite: {loss}"
     missing = [name for name, p in model.named_parameters() if p.grad is None]
@@ -105,7 +102,6 @@ def check_tied_embedding_is_shared():
 def check_gradient_sync_tags_match_sharding_rules():
     """Never classify a TP shard as replicated during gradient finalization."""
     model = build_reference_model(CONFIG)
-    set_tensor_parallel_attributes(model)
 
     mismatches = []
     for name, parameter in model.named_parameters():
@@ -129,6 +125,11 @@ CHECKS = [
     check_tied_embedding_is_shared,
     check_gradient_sync_tags_match_sharding_rules,
 ]
+
+
+def test_sharding_checks():
+    for check in CHECKS:
+        check()
 
 
 def main():
